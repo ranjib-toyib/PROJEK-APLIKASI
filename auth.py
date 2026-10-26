@@ -85,3 +85,7 @@ def auth_gate():
         else:
             print("\nPilihan tidak valid!")
             input("\nTekan Enter untuk mencoba lagi...")
+
+
+if __name__ == "__main__":
+    auth_gate()

@@ -4,6 +4,7 @@ import bangun_datar as bd
 import matematika as mt
 import auth as au
 
+
 def menu():
     os.system("cls" if os.name == "nt" else "clear")
     print("========== PROGRAM UTAMA ==========")

@@ -1,0 +1,332 @@
+"""
+Aplikasi Ujian Online - Flask + SQLite
+Jalankan:  pip install flask  ->  python app.py
+Siswa : http://IP-KOMPUTER:5000        Guru : http://IP-KOMPUTER:5000/guru
+Password guru default: guru123  (ubah lewat variabel lingkungan GURU_PASSWORD)
+"""
+import os, hmac, hashlib, time, json, sqlite3, secrets
+from functools import wraps
+from flask import Flask, request, session, redirect, jsonify, g, render_template_string
+from markupsafe import Markup
+
+DB = "ujian.db"
+WINDOW = 900  # kode berganti setiap 15 menit (detik)
+PASS_GURU = os.environ.get("GURU_PASSWORD", "guru123")
+
+if not os.path.exists("secret.key"):
+    open("secret.key", "w").write(secrets.token_hex(32))
+SECRET = open("secret.key").read().strip()
+
+app = Flask(__name__)
+app.secret_key = SECRET
+
+# ---------------------------------------------------------------- database
+def db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+@app.teardown_appcontext
+def close_db(_):
+    d = g.pop("db", None)
+    if d: d.close()
+
+def init_db():
+    c = sqlite3.connect(DB)
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS exams(id INTEGER PRIMARY KEY, judul TEXT, durasi INTEGER, aktif INTEGER DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS questions(id INTEGER PRIMARY KEY, exam_id INTEGER, tipe TEXT, teks TEXT,
+        opsi TEXT, kunci TEXT, poin INTEGER DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS attempts(id INTEGER PRIMARY KEY, exam_id INTEGER, nama TEXT, mulai REAL,
+        selesai REAL, terakhir REAL, nilai REAL);
+    CREATE TABLE IF NOT EXISTS answers(attempt_id INTEGER, question_id INTEGER, jawaban TEXT,
+        PRIMARY KEY(attempt_id, question_id));
+    """)
+    c.commit(); c.close()
+
+# ------------------------------------------------------------ kode 15 menit
+def kode(exam_id):
+    w = int(time.time() // WINDOW)
+    h = hmac.new(SECRET.encode(), f"{exam_id}:{w}".encode(), hashlib.sha256).hexdigest()
+    return str(int(h[:8], 16) % 1000000).zfill(6)
+
+def sisa_kode():
+    return WINDOW - int(time.time()) % WINDOW
+
+# ------------------------------------------------------------------ penilaian
+def norm(s): return " ".join((s or "").lower().split())
+
+def benar(q, jawab):
+    if q["tipe"] == "pg":
+        return norm(jawab) == norm(q["kunci"])
+    return norm(jawab) in [norm(k) for k in q["kunci"].split("|")]
+
+def hitung_nilai(aid, exam_id):
+    qs = db().execute("SELECT * FROM questions WHERE exam_id=?", (exam_id,)).fetchall()
+    ans = {r["question_id"]: r["jawaban"] for r in
+           db().execute("SELECT * FROM answers WHERE attempt_id=?", (aid,))}
+    total = sum(q["poin"] for q in qs) or 1
+    dapat = sum(q["poin"] for q in qs if q["id"] in ans and benar(q, ans[q["id"]]))
+    return round(dapat * 100 / total, 1)
+
+def selesaikan(a):
+    if not a["selesai"]:
+        db().execute("UPDATE attempts SET selesai=?, nilai=? WHERE id=?",
+                     (time.time(), hitung_nilai(a["id"], a["exam_id"]), a["id"]))
+        db().commit()
+
+# ------------------------------------------------------------------ tampilan
+BASE = """<!doctype html><html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{{title}}</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#f4f6f8;margin:0;color:#222}
+.w{max-width:820px;margin:24px auto;padding:0 14px}
+.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:14px;box-shadow:0 1px 3px #0002}
+input,select,textarea{width:100%;padding:9px;margin:4px 0 10px;border:1px solid #bbb;border-radius:6px;box-sizing:border-box;font-size:15px}
+button,.btn{background:#2563eb;color:#fff;border:0;padding:9px 16px;border-radius:6px;cursor:pointer;text-decoration:none;font-size:15px;display:inline-block}
+.merah{background:#dc2626}.abu{background:#6b7280}
+table{width:100%;border-collapse:collapse}td,th{padding:7px;border-bottom:1px solid #ddd;text-align:left;font-size:14px}
+.kode{font-size:44px;letter-spacing:8px;font-weight:700;color:#2563eb}
+.opsi{display:block;padding:8px;border:1px solid #ddd;border-radius:6px;margin:5px 0;cursor:pointer}
+.opsi input{width:auto;margin-right:8px}.err{color:#dc2626}.ok{color:#16a34a}
+#timer{position:sticky;top:0;background:#111;color:#fff;padding:8px;text-align:center;z-index:9}
+</style></head><body>{{inner}}</body></html>"""
+
+def page(title, body, **ctx):
+    return render_template_string(BASE, title=title, inner=Markup(render_template_string(body, **ctx)))
+
+# ===================================================================== SISWA
+@app.route("/")
+def home():
+    return page("Masuk Ujian", """<div class="w"><div class="card"><h2>Masuk Ujian</h2>
+    {% if err %}<p class="err">{{err}}</p>{% endif %}
+    <form method="post" action="/masuk">
+    <label>Nama lengkap</label><input name="nama" required>
+    <label>Kode ujian (6 angka, dari guru)</label><input name="kode" required maxlength="6" inputmode="numeric">
+    <button>Masuk</button></form></div>
+    <a href="/guru" style="font-size:13px">Login guru</a></div>""", err=request.args.get("err"))
+
+@app.route("/masuk", methods=["POST"])
+def masuk():
+    nama = request.form["nama"].strip()[:60]
+    k = request.form["kode"].strip()
+    for e in db().execute("SELECT * FROM exams WHERE aktif=1"):
+        if hmac.compare_digest(k, kode(e["id"])):
+            a = db().execute("SELECT * FROM attempts WHERE exam_id=? AND lower(nama)=lower(?)",
+                             (e["id"], nama)).fetchone()
+            if a and a["selesai"]:
+                return redirect("/?err=Anda sudah menyelesaikan ujian ini")
+            if not a:
+                cur = db().execute("INSERT INTO attempts(exam_id,nama,mulai,terakhir) VALUES(?,?,?,?)",
+                                   (e["id"], nama, time.time(), time.time()))
+                db().commit(); aid = cur.lastrowid
+            else:
+                aid = a["id"]
+            session["aid"] = aid
+            return redirect("/ujian")
+    return redirect("/?err=Kode salah atau sudah kedaluwarsa")
+
+def attempt_siswa():
+    aid = session.get("aid")
+    return db().execute("SELECT * FROM attempts WHERE id=?", (aid,)).fetchone() if aid else None
+
+@app.route("/ujian")
+def ujian():
+    a = attempt_siswa()
+    if not a: return redirect("/")
+    if a["selesai"]: return redirect("/selesai")
+    e = db().execute("SELECT * FROM exams WHERE id=?", (a["exam_id"],)).fetchone()
+    sisa = int(a["mulai"] + e["durasi"] * 60 - time.time())
+    if sisa <= 0:
+        selesaikan(a); return redirect("/selesai")
+    qs = []
+    for q in db().execute("SELECT * FROM questions WHERE exam_id=? ORDER BY id", (e["id"],)):
+        qs.append(dict(q, opsi=json.loads(q["opsi"] or "[]")))
+    ans = {r["question_id"]: r["jawaban"] for r in
+           db().execute("SELECT * FROM answers WHERE attempt_id=?", (a["id"],))}
+    return page(e["judul"], """<div id="timer">Sisa waktu: <b id="t"></b> &nbsp;|&nbsp; {{a.nama}}</div>
+    <div class="w"><h2>{{e.judul}}</h2>
+    {% for q in qs %}<div class="card"><b>{{loop.index}}.</b> {{q.teks}}
+    {% if q.tipe=='pg' %}{% for o in q.opsi %}
+      <label class="opsi"><input type="radio" name="q{{q.id}}" value="{{o}}" data-q="{{q.id}}"
+      {{'checked' if ans.get(q.id)==o}}>{{o}}</label>{% endfor %}
+    {% else %}<input data-q="{{q.id}}" placeholder="Jawaban singkat" value="{{ans.get(q.id,'')}}">{% endif %}
+    </div>{% endfor %}
+    <button onclick="kirim()">Kirim Jawaban</button> <span id="st" class="ok"></span></div>
+    <script>
+    let s={{sisa}}, tm={};
+    function simpan(el){fetch('/simpan',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({qid:el.dataset.q,jawaban:el.value})}).then(r=>{
+      document.getElementById('st').textContent=r.ok?'Tersimpan':'Gagal menyimpan'});}
+    document.querySelectorAll('[data-q]').forEach(el=>{
+      el.addEventListener('input',()=>{clearTimeout(tm[el.dataset.q]);tm[el.dataset.q]=setTimeout(()=>simpan(el),500)});});
+    function kirim(force){if(force||confirm('Kirim jawaban? Tidak bisa diubah lagi.'))
+      fetch('/kirim',{method:'POST'}).then(()=>location='/selesai');}
+    setInterval(()=>{s--;if(s<=0){kirim(true);return}
+      document.getElementById('t').textContent=Math.floor(s/60)+':'+String(s%60).padStart(2,'0')},1000);
+    setInterval(()=>fetch('/simpan',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}),20000);
+    </script>""", a=a, e=e, qs=qs, ans=ans, sisa=sisa)
+
+@app.route("/simpan", methods=["POST"])
+def simpan():
+    a = attempt_siswa()
+    if not a or a["selesai"]: return "", 403
+    d = request.get_json(silent=True) or {}
+    db().execute("UPDATE attempts SET terakhir=? WHERE id=?", (time.time(), a["id"]))
+    if d.get("qid"):
+        e = db().execute("SELECT durasi FROM exams WHERE id=?", (a["exam_id"],)).fetchone()
+        if time.time() > a["mulai"] + e["durasi"] * 60 + 5: return "", 403
+        ok = db().execute("SELECT 1 FROM questions WHERE id=? AND exam_id=?", (d["qid"], a["exam_id"])).fetchone()
+        if ok:
+            db().execute("INSERT OR REPLACE INTO answers VALUES(?,?,?)", (a["id"], d["qid"], str(d.get("jawaban", ""))[:500]))
+    db().commit()
+    return "ok"
+
+@app.route("/kirim", methods=["POST"])
+def kirim():
+    a = attempt_siswa()
+    if a: selesaikan(a)
+    return "ok"
+
+@app.route("/selesai")
+def selesai():
+    session.pop("aid", None)
+    return page("Selesai", """<div class="w"><div class="card"><h2>Ujian selesai</h2>
+    <p>Jawaban Anda telah terkirim. Terima kasih.</p><a class="btn" href="/">Kembali</a></div></div>""")
+
+# ===================================================================== GURU
+def guru(f):
+    @wraps(f)
+    def w(*a, **k):
+        if not session.get("guru"): return redirect("/guru/login")
+        return f(*a, **k)
+    return w
+
+@app.route("/guru/login", methods=["GET", "POST"])
+def guru_login():
+    err = None
+    if request.method == "POST":
+        if hmac.compare_digest(request.form["pw"], PASS_GURU):
+            session["guru"] = True; return redirect("/guru")
+        err = "Password salah"
+    return page("Login Guru", """<div class="w"><div class="card"><h2>Login Guru</h2>
+    {% if err %}<p class="err">{{err}}</p>{% endif %}
+    <form method="post"><input type="password" name="pw" placeholder="Password" required>
+    <button>Masuk</button></form></div></div>""", err=err)
+
+@app.route("/guru/keluar")
+def guru_keluar():
+    session.pop("guru", None); return redirect("/")
+
+@app.route("/guru", methods=["GET", "POST"])
+@guru
+def guru_home():
+    if request.method == "POST":
+        cur = db().execute("INSERT INTO exams(judul,durasi) VALUES(?,?)",
+                           (request.form["judul"], int(request.form["durasi"])))
+        db().commit(); return redirect(f"/guru/ujian/{cur.lastrowid}")
+    exams = db().execute("SELECT * FROM exams ORDER BY id DESC").fetchall()
+    return page("Dashboard Guru", """<div class="w"><h2>Dashboard Guru <a class="btn abu" href="/guru/keluar" style="float:right">Keluar</a></h2>
+    <div class="card"><h3>Buat ujian baru</h3><form method="post">
+    <input name="judul" placeholder="Judul ujian" required>
+    <input name="durasi" type="number" min="1" value="60" required> menit
+    <button>Buat</button></form></div>
+    <div class="card"><h3>Daftar ujian</h3><table>
+    {% for e in exams %}<tr><td>{{e.judul}}</td><td>{{e.durasi}} mnt</td>
+    <td>{{'Aktif' if e.aktif else 'Nonaktif'}}</td><td><a href="/guru/ujian/{{e.id}}">Kelola &amp; Pantau</a></td></tr>
+    {% else %}<tr><td>Belum ada ujian</td></tr>{% endfor %}</table></div></div>""", exams=exams)
+
+@app.route("/guru/ujian/<int:eid>")
+@guru
+def guru_ujian(eid):
+    e = db().execute("SELECT * FROM exams WHERE id=?", (eid,)).fetchone()
+    qs = db().execute("SELECT * FROM questions WHERE exam_id=? ORDER BY id", (eid,)).fetchall()
+    return page(e["judul"], """<div class="w"><a href="/guru">&larr; Kembali</a><h2>{{e.judul}} ({{e.durasi}} menit)</h2>
+    <div class="card" style="text-align:center"><div>Kode masuk siswa saat ini</div>
+    <div class="kode" id="kode">------</div><div>Berganti dalam <b id="sisa">--</b></div>
+    <p><a class="btn {{'merah' if e.aktif else ''}}" href="/guru/ujian/{{e.id}}/toggle">
+    {{'Tutup ujian' if e.aktif else 'Buka ujian'}}</a></p></div>
+    <div class="card"><h3>Pemantauan siswa <small id="jml"></small></h3>
+    <table><thead><tr><th>Nama</th><th>Status</th><th>Terjawab</th><th>Aktif terakhir</th><th>Nilai</th><th></th></tr></thead>
+    <tbody id="mon"></tbody></table></div>
+    <div class="card"><h3>Tambah soal</h3><form method="post" action="/guru/ujian/{{e.id}}/soal">
+    <select name="tipe" id="tipe" onchange="gt()"><option value="pg">Pilihan ganda</option><option value="isian">Isian singkat</option></select>
+    <textarea name="teks" placeholder="Teks soal" required></textarea>
+    <div id="pg">{% for h in 'ABCD' %}<input name="o{{h}}" placeholder="Opsi {{h}}">{% endfor %}
+    <select name="kunci_pg"><option value="A">Kunci: A</option><option value="B">Kunci: B</option>
+    <option value="C">Kunci: C</option><option value="D">Kunci: D</option></select></div>
+    <div id="is" style="display:none"><input name="kunci_isian" placeholder="Kunci jawaban (beberapa jawaban benar pisahkan dengan |)"></div>
+    <input name="poin" type="number" value="1" min="1"> poin <button>Simpan soal</button></form></div>
+    <div class="card"><h3>Daftar soal ({{qs|length}})</h3><table>
+    {% for q in qs %}<tr><td>{{loop.index}}. {{q.teks}}</td><td>{{'PG' if q.tipe=='pg' else 'Isian'}}</td>
+    <td><a href="/guru/soal/{{q.id}}/hapus" onclick="return confirm('Hapus soal?')">hapus</a></td></tr>{% endfor %}</table></div></div>
+    <script>
+    function gt(){const p=document.getElementById('tipe').value=='pg';
+      document.getElementById('pg').style.display=p?'':'none';document.getElementById('is').style.display=p?'none':''}
+    function muat(){fetch('/guru/api/{{e.id}}').then(r=>r.json()).then(d=>{
+      kode.textContent=d.kode;sisa.textContent=Math.floor(d.sisa/60)+':'+String(d.sisa%60).padStart(2,'0');
+      jml.textContent='('+d.siswa.length+' siswa)';
+      mon.innerHTML=d.siswa.map(s=>'<tr><td>'+s.nama.replace(/</g,'&lt;')+'</td><td>'+s.status+'</td><td>'+s.terjawab+'/'+d.total+
+      '</td><td>'+s.lalu+' dtk</td><td>'+(s.nilai??'-')+'</td><td><a href="/guru/hasil/'+s.id+'">detail</a></td></tr>').join('')})}
+    muat();setInterval(muat,3000);
+    </script>""", e=e, qs=qs)
+
+@app.route("/guru/api/<int:eid>")
+@guru
+def guru_api(eid):
+    total = db().execute("SELECT COUNT(*) FROM questions WHERE exam_id=?", (eid,)).fetchone()[0]
+    out = []
+    for a in db().execute("SELECT * FROM attempts WHERE exam_id=? ORDER BY mulai", (eid,)):
+        n = db().execute("SELECT COUNT(*) FROM answers WHERE attempt_id=? AND jawaban!=''", (a["id"],)).fetchone()[0]
+        lalu = int(time.time() - (a["terakhir"] or a["mulai"]))
+        st = "Selesai" if a["selesai"] else ("Mengerjakan" if lalu < 60 else "Terputus?")
+        out.append(dict(id=a["id"], nama=a["nama"], status=st, terjawab=n, lalu=lalu, nilai=a["nilai"]))
+    return jsonify(kode=kode(eid), sisa=sisa_kode(), total=total, siswa=out)
+
+@app.route("/guru/ujian/<int:eid>/toggle")
+@guru
+def toggle(eid):
+    db().execute("UPDATE exams SET aktif=1-aktif WHERE id=?", (eid,)); db().commit()
+    return redirect(f"/guru/ujian/{eid}")
+
+@app.route("/guru/ujian/<int:eid>/soal", methods=["POST"])
+@guru
+def tambah_soal(eid):
+    f = request.form
+    if f["tipe"] == "pg":
+        opsi = [f["o" + h].strip() for h in "ABCD" if f["o" + h].strip()]
+        kunci = f["o" + f["kunci_pg"]].strip()
+    else:
+        opsi, kunci = [], f["kunci_isian"].strip()
+    db().execute("INSERT INTO questions(exam_id,tipe,teks,opsi,kunci,poin) VALUES(?,?,?,?,?,?)",
+                 (eid, f["tipe"], f["teks"], json.dumps(opsi), kunci, int(f["poin"])))
+    db().commit()
+    return redirect(f"/guru/ujian/{eid}")
+
+@app.route("/guru/soal/<int:qid>/hapus")
+@guru
+def hapus_soal(qid):
+    q = db().execute("SELECT exam_id FROM questions WHERE id=?", (qid,)).fetchone()
+    db().execute("DELETE FROM questions WHERE id=?", (qid,)); db().commit()
+    return redirect(f"/guru/ujian/{q['exam_id']}")
+
+@app.route("/guru/hasil/<int:aid>")
+@guru
+def hasil(aid):
+    a = db().execute("SELECT * FROM attempts WHERE id=?", (aid,)).fetchone()
+    ans = {r["question_id"]: r["jawaban"] for r in db().execute("SELECT * FROM answers WHERE attempt_id=?", (aid,))}
+    rows = [dict(teks=q["teks"], jawab=ans.get(q["id"], ""), kunci=q["kunci"],
+                 ok=benar(q, ans.get(q["id"], "")) if q["id"] in ans else False)
+            for q in db().execute("SELECT * FROM questions WHERE exam_id=? ORDER BY id", (a["exam_id"],))]
+    nilai = a["nilai"] if a["selesai"] else hitung_nilai(aid, a["exam_id"])
+    return page("Detail", """<div class="w"><a href="/guru/ujian/{{a.exam_id}}">&larr; Kembali</a>
+    <h2>{{a.nama}} &mdash; nilai {{nilai}}{{'' if a.selesai else ' (sementara)'}}</h2><div class="card"><table>
+    <tr><th>Soal</th><th>Jawaban siswa</th><th>Kunci</th><th></th></tr>
+    {% for r in rows %}<tr><td>{{r.teks}}</td><td>{{r.jawab or '-'}}</td><td>{{r.kunci}}</td>
+    <td class="{{'ok' if r.ok else 'err'}}">{{'Benar' if r.ok else 'Salah'}}</td></tr>{% endfor %}</table></div></div>""",
+        a=a, rows=rows, nilai=nilai)
+
+if __name__ == "__main__":
+    init_db()
+    app.run(host="0.0.0.0", port=5000, debug=False)
