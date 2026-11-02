@@ -38,6 +38,57 @@ def init_db():
 def home():
     return redirect("/guru")
 
+    
+
+# ======================= HARI 2: LOGIN GURU =======================
+BASE = """<!doctype html><html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Ujian</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#f4f6f8;margin:0}
+.w{max-width:800px;margin:24px auto;padding:0 14px}
+.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:14px;box-shadow:0 1px 3px #0002}
+input,select,textarea{width:100%;padding:9px;margin:4px 0 10px;border:1px solid #bbb;border-radius:6px;box-sizing:border-box}
+button,.btn{background:#2563eb;color:#fff;border:0;padding:9px 16px;border-radius:6px;cursor:pointer;text-decoration:none}
+table{width:100%;border-collapse:collapse}td,th{padding:7px;border-bottom:1px solid #ddd;text-align:left}
+.err{color:#dc2626}
+</style></head><body><div class="w">{{inner}}</div></body></html>"""
+
+def page(body, **ctx):
+    inner = Markup(render_template_string(body, **ctx))
+    return render_template_string(BASE, inner=inner)
+
+def guru(f):
+    @wraps(f)
+    def w(*a, **k):
+        if not session.get("guru"):
+            return redirect("/guru/login")
+        return f(*a, **k)
+    return w
+
+@app.route("/guru/login", methods=["GET", "POST"])
+def guru_login():
+    err = None
+    if request.method == "POST":
+        if hmac.compare_digest(request.form["pw"], PASS_GURU):
+            session["guru"] = True
+            return redirect("/guru")
+        err = "Password salah"
+    return page("""<div class="card"><h2>Login Guru</h2>
+    {% if err %}<p class="err">{{err}}</p>{% endif %}
+    <form method="post"><input type="password" name="pw" placeholder="Password" required>
+    <button>Masuk</button></form></div>""", err=err)
+
+@app.route("/guru/keluar")
+def guru_keluar():
+    session.pop("guru", None)
+    return redirect("/guru/login")
+
+@app.route("/guru")
+@guru
+def guru_home():
+    return page("""<div class="card"><h2>Dashboard Guru</h2>
+    <p>Login berhasil.</p><a class="btn" href="/guru/keluar">Keluar</a></div>""")
+  
 
 if __name__ == "__main__":
     init_db()
