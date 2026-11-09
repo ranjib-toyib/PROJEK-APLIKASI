@@ -1,10 +1,12 @@
-import sqlite3, json, hmac
+import sqlite3, json, hmac, hashlib, time
 from functools import wraps
-from flask import Flask, request, session, redirect, g, render_template_string
+from flask import Flask, request, session, redirect, g, render_template_string, jsonify, abort
 from markupsafe import Markup
 
 DB = "ujian.db"
-PASS_GURU = "guru321"          
+PASS_GURU = "guru321"     
+SECRET = "ganti-kunci-ini"      
+WINDOW = 900       
 
 app = Flask(__name__)
 app.secret_key = "ganti-kunci-ini"   # dipakai untuk session login
@@ -89,6 +91,135 @@ def guru_home():
     return page("""<div class="card"><h2>Dashboard Guru</h2>
     <p>Login berhasil.</p><a class="btn" href="/guru/keluar">Keluar</a></div>""")
   
+
+if __name__ == "__main__":
+    init_db()
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
+
+    # ======================= KELOLA =======================
+    
+def ambil_ujian(eid):
+    e = db().execute("SELECT * FROM exams WHERE id=?", (eid,)).fetchone()
+    if not e:
+        abort(404)
+    return e
+
+def kode(exam_id):
+    w = int(time.time() // WINDOW)
+    h = hmac.new(SECRET.encode(), f"{exam_id}:{w}".encode(), hashlib.sha256).hexdigest()
+    return str(int(h[:8], 16) % 1000000).zfill(6)
+
+def sisa_kode():
+    return WINDOW - int(time.time()) % WINDOW
+
+
+# (2) GANTI route /guru yang lama (yang hanya "Login berhasil") dengan ini:
+@app.route("/guru", methods=["GET", "POST"])
+@guru
+def guru_home():
+    if request.method == "POST":
+        judul = request.form["judul"].strip()
+        durasi = max(1, int(request.form["durasi"]))
+        cur = db().execute("INSERT INTO exams(judul,durasi) VALUES(?,?)", (judul, durasi))
+        db().commit()
+        return redirect(f"/guru/ujian/{cur.lastrowid}")
+    exams = db().execute("SELECT * FROM exams ORDER BY id DESC").fetchall()
+    return page("""<h2>Dashboard Guru
+    <a class="btn abu" href="/guru/keluar" style="float:right">Keluar</a></h2>
+    <div class="card"><h3>Buat ujian baru</h3><form method="post">
+    <input name="judul" placeholder="Judul ujian" required>
+    <input name="durasi" type="number" min="1" value="60" required> menit
+    <button>Buat</button></form></div>
+    <div class="card"><h3>Daftar ujian</h3><table>
+    {% for e in exams %}<tr><td>{{e.judul}}</td><td>{{e.durasi}} mnt</td>
+    <td>{{'Aktif' if e.aktif else 'Nonaktif'}}</td>
+    <td><a href="/guru/ujian/{{e.id}}">Kelola</a></td></tr>
+    {% else %}<tr><td>Belum ada ujian</td></tr>{% endfor %}</table></div>""", exams=exams)
+
+
+@app.route("/guru/ujian/<int:eid>")
+@guru
+def guru_ujian(eid):
+    e = ambil_ujian(eid)
+    qs = db().execute("SELECT * FROM questions WHERE exam_id=? ORDER BY id", (eid,)).fetchall()
+    return page("""<a href="/guru">&larr; Kembali</a>
+    <h2>{{e.judul}} ({{e.durasi}} menit)</h2>
+
+    <div class="card" style="text-align:center"><div>Kode masuk siswa saat ini</div>
+    <div class="kode" id="kode">------</div><div>Berganti dalam <b id="sisa">--</b></div>
+    <form method="post" action="/guru/ujian/{{e.id}}/toggle" style="margin-top:10px">
+    <button class="{{'merah' if e.aktif else ''}}">{{'Tutup ujian' if e.aktif else 'Buka ujian'}}</button></form></div>
+
+    <div class="card"><h3>Tambah soal</h3>
+    <form method="post" action="/guru/ujian/{{e.id}}/soal">
+    <select name="tipe" id="tipe" onchange="gt()"><option value="pg">Pilihan ganda</option><option value="isian">Isian singkat</option></select>
+    <textarea name="teks" placeholder="Teks soal" required></textarea>
+    <div id="pg">{% for h in 'ABCD' %}<input name="o{{h}}" placeholder="Opsi {{h}}">{% endfor %}
+    <select name="kunci_pg"><option value="A">Kunci: A</option><option value="B">Kunci: B</option>
+    <option value="C">Kunci: C</option><option value="D">Kunci: D</option></select></div>
+    <div id="is" style="display:none"><input name="kunci_isian" placeholder="Kunci jawaban (beberapa jawaban benar pisahkan dengan |)"></div>
+    <input name="poin" type="number" value="1" min="1"> poin <button>Simpan soal</button></form></div>
+
+    <div class="card"><h3>Daftar soal ({{qs|length}})</h3><table>
+    {% for q in qs %}<tr><td>{{loop.index}}. {{q.teks}}</td><td>{{'PG' if q.tipe=='pg' else 'Isian'}}</td>
+    <td><form class="inline" method="post" action="/guru/soal/{{q.id}}/hapus" onsubmit="return confirm('Hapus soal?')">
+    <button class="merah" style="padding:3px 10px">hapus</button></form></td></tr>
+    {% else %}<tr><td>Belum ada soal</td></tr>{% endfor %}</table></div>
+
+    <script>
+    function gt(){const p=document.getElementById('tipe').value=='pg';
+      document.getElementById('pg').style.display=p?'':'none';
+      document.getElementById('is').style.display=p?'none':''}
+    function muat(){fetch('/guru/api/{{e.id}}/kode').then(r=>r.json()).then(d=>{
+      kode.textContent=d.kode;
+      sisa.textContent=Math.floor(d.sisa/60)+':'+String(d.sisa%60).padStart(2,'0')})}
+    muat();setInterval(muat,3000);
+    </script>""", e=e, qs=qs)
+
+@app.route("/guru/api/<int:eid>/kode")
+@guru
+def api_kode(eid):
+    ambil_ujian(eid)
+    return jsonify(kode=kode(eid), sisa=sisa_kode())
+
+@app.route("/guru/ujian/<int:eid>/toggle", methods=["POST"])
+@guru
+def toggle(eid):
+    ambil_ujian(eid)
+    db().execute("UPDATE exams SET aktif=1-aktif WHERE id=?", (eid,))
+    db().commit()
+    return redirect(f"/guru/ujian/{eid}")
+
+@app.route("/guru/ujian/<int:eid>/soal", methods=["POST"])
+@guru
+def tambah_soal(eid):
+    ambil_ujian(eid)
+    f = request.form
+    if f["tipe"] == "pg":
+        opsi = [f["o" + h].strip() for h in "ABCD" if f["o" + h].strip()]
+        kunci = f["o" + f["kunci_pg"]].strip()
+        if len(opsi) < 2 or not kunci:
+            return "Isi minimal 2 opsi dan pastikan opsi kunci tidak kosong. <a href='javascript:history.back()'>Kembali</a>", 400
+    else:
+        opsi, kunci = [], f["kunci_isian"].strip()
+        if not kunci:
+            return "Kunci jawaban harus diisi. <a href='javascript:history.back()'>Kembali</a>", 400
+    db().execute("INSERT INTO questions(exam_id,tipe,teks,opsi,kunci,poin) VALUES(?,?,?,?,?,?)",
+                 (eid, f["tipe"], f["teks"].strip(), json.dumps(opsi), kunci, max(1, int(f["poin"]))))
+    db().commit()
+    return redirect(f"/guru/ujian/{eid}")
+
+@app.route("/guru/soal/<int:qid>/hapus", methods=["POST"])
+@guru
+def hapus_soal(qid):
+    q = db().execute("SELECT exam_id FROM questions WHERE id=?", (qid,)).fetchone()
+    if not q:
+        abort(404)
+    db().execute("DELETE FROM questions WHERE id=?", (qid,))
+    db().commit()
+    return redirect(f"/guru/ujian/{q['exam_id']}")
+
 
 if __name__ == "__main__":
     init_db()
